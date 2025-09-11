@@ -1,51 +1,63 @@
+
+/*/*
+   Based on 31337Ghost's reference code from https://github.com/nkolban/esp32-snippets/issues/385#issuecomment-362535434
+   which is based on pcbreflux's Arduino ESP32 port of Neil Kolban's example for IDF: https://github.com/nkolban/esp32-snippets/blob/master/cpp_utils/tests/BLE%20Tests/SampleScan.cpp
+*/
+
 /*
-    Video: https://www.youtube.com/watch?v=oCMOYS71NIU
-    Based on Neil Kolban example for IDF: https://github.com/nkolban/esp32-snippets/blob/master/cpp_utils/tests/BLE%20Tests/SampleNotify.cpp
-    Ported to Arduino ESP32 by Evandro Copercini
-
-   Create a BLE server that, once we receive a connection, will send periodic notifications.
-   The service advertises itself as: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
-   Has a characteristic of: 6E400002-B5A3-F393-E0A9-E50E24DCCA9E - used for receiving data with "WRITE"
-   Has a characteristic of: 6E400003-B5A3-F393-E0A9-E50E24DCCA9E - used to send data with  "NOTIFY"
-
+   Create a BLE server that will send periodic iBeacon frames.
    The design of creating the BLE server is:
    1. Create a BLE Server
-   2. Create a BLE Service
-   3. Create a BLE Characteristic on the Service
-   4. Create a BLE Descriptor on the characteristic
-   5. Start the service.
-   6. Start advertising.
-
-   In this example rxValue is the data received (only accessible inside that function).
-   And txValue is the data to be sent, in this example just a byte incremented every second.
+   2. Create advertising data
+   3. Start advertising.
+   4. wait
+   5. Stop advertising.
 */
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <BLEBeacon.h>
+#include <string>
+#include <Arduino.h>
 
-BLEServer *pServer = NULL;
-BLECharacteristic *pTxCharacteristic;
+#define DEVICE_NAME         "ESP32-FTFD"
+#define SERVICE_UUID        "7A0247E7-8E88-409B-A959-AB5092DDB03E"
+#define BEACON_UUID         "2D7A9F0C-E0E8-4CC9-A71B-A21DB2D034A1"
+#define CHARACTERISTIC_UUID "82258BAA-DF72-47E8-99BC-B73D7ECD08A5"
+
+static uint8_t fallFrame[8];
+uint8_t FallStatus = 0;
+
+BLEServer *pServer;
+BLECharacteristic *pCharacteristic;
+BLEAdvertising *pAdvertising;
 bool deviceConnected = false;
-bool oldDeviceConnected = false;
-uint8_t txValue = 0;
+uint8_t value = 0;
 
-// See the following for generating UUIDs:
-// https://www.uuidgenerator.net/
+// Variables for non-blocking timing
+unsigned long previousMillis = 0;
+unsigned long burstStartMillis = 0;
+const long interval = 10000; // 10 seconds
+const long burstDuration = 100; // 100 milliseconds
 
-#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"  // UART service UUID
-#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+bool isAdvertising = false;
+
+void Fall_Frame_Send(uint8_t *fallFrame, uint8_t FallStatus);
+void updateScanResponse(uint8_t *fallFrame);
 
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
     deviceConnected = true;
-    Serial.println("Device connected");
+    Serial.println("deviceConnected = true");
   };
 
   void onDisconnect(BLEServer *pServer) {
     deviceConnected = false;
-    Serial.println("Device disconnected");
+    Serial.println("deviceConnected = false");
+    // Restart advertising to be visible and connectable again
+    pAdvertising->start();
+    Serial.println("iBeacon advertising restarted");
   }
 };
 
@@ -59,65 +71,144 @@ class MyCallbacks : public BLECharacteristicCallbacks {
       for (int i = 0; i < rxValue.length(); i++) {
         Serial.print(rxValue[i]);
       }
-
       Serial.println();
       Serial.println("*********");
     }
   }
 };
 
-void setup() {
-  Serial.begin(115200);
-
-  // Create the BLE Device
-  BLEDevice::init("UART Service");
-
-  // Create the BLE Server
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
+void init_service() {
   // Create the BLE Service
-  BLEService *pService = pServer->createService(SERVICE_UUID);
+  BLEService *pService = pServer->createService(BLEUUID(SERVICE_UUID));
 
   // Create a BLE Characteristic
-  pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pCharacteristic->addDescriptor(new BLE2902());
 
-  // Descriptor 2902 is not required when using NimBLE as it is automatically added based on the characteristic properties
-  pTxCharacteristic->addDescriptor(new BLE2902());
-
-  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
-
-  pRxCharacteristic->setCallbacks(new MyCallbacks());
+  pAdvertising->addServiceUUID(BLEUUID(SERVICE_UUID));
 
   // Start the service
   pService->start();
+}
 
-  // Start advertising
-  pServer->getAdvertising()->start();
-  Serial.println("Waiting a client connection to notify...");
+void init_beacon(uint8_t *fallFrame) {
+  // --- iBeacon advertisement ---
+  BLEBeacon b;
+  b.setManufacturerId(0x4C00);           // Apple Inc.
+  b.setProximityUUID(BLEUUID(BEACON_UUID));
+  b.setMajor(5);
+  b.setMinor(88);
+  b.setSignalPower((int8_t)-59);
+
+  // --- Scan Response: put fallFrame here ---
+  uint8_t buf[10];
+  buf[0] = 0xE5;  // Espressif company ID low byte
+  buf[1] = 0x02;  // Espressif company ID high byte
+  memcpy(buf + 2, fallFrame, 8);
+
+  BLEAdvertisementData adv;
+  adv.setFlags(0x1A);
+  adv.setName(DEVICE_NAME);
+  adv.setManufacturerData(String((char*)buf, 10));  // correct iBeacon payload
+  pAdvertising->setAdvertisementData(adv);
+
+  pAdvertising->setMinInterval(0x10000); // Set min interval to 10 seconds
+  pAdvertising->setMaxInterval(0x10000); // Set max interval to
+  pAdvertising->start();
+
+  Serial.println("iBeacon advertising started (Apple 0x004C).");
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("Initializing...");
+  Serial.flush();
+
+  BLEDevice::init(DEVICE_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  pAdvertising = pServer->getAdvertising();
+
+  init_service();
+  init_beacon(fallFrame);
+
+  Serial.println("iBeacon + service defined and advertising!");
 }
 
 void loop() {
-
   if (deviceConnected) {
-    Serial.print("Notifying Value: ");
-    Serial.println(txValue);
-    pTxCharacteristic->setValue(&txValue, 1);
-    pTxCharacteristic->notify();
-    txValue++;
-    delay(1000);  // Notifying every 1 second
+    Serial.printf("*** NOTIFY: %d ***\n", value);
+    pCharacteristic->setValue(&value, 1);
+    pCharacteristic->notify();
+    value++;
   }
 
-  // disconnecting
-  if (!deviceConnected && oldDeviceConnected) {
-    delay(500);                   // give the bluetooth stack the chance to get things ready
-    pServer->startAdvertising();  // restart advertising
-    Serial.println("Started advertising again...");
-    oldDeviceConnected = false;
+  // State 1: Check if it's time to start a new advertising burst.
+  if (!isAdvertising && millis() - previousMillis >= interval) {
+    previousMillis = millis();
+
+    // The Fall_Frame_Send function now just updates the global fallFrame array.
+    // We'll alternate between 0 and 1 for demonstration.
+    FallStatus = (FallStatus == 0) ? 1 : 0;
+    Fall_Frame_Send(fallFrame, FallStatus);
+
+    init_beacon(fallFrame);
+
+    // Start advertising and switch to the advertising state.
+    pAdvertising->start();
+    burstStartMillis = millis();
+    isAdvertising = true;
+
+    Serial.println("Starting advertising burst.");
   }
-  // connecting
-  if (deviceConnected && !oldDeviceConnected) {
-    // do stuff here on connecting
-    oldDeviceConnected = true;
+  
+  // State 2: Check if it's time to end the advertising burst.
+  if (isAdvertising && millis() - burstStartMillis >= burstDuration) {
+    pAdvertising->stop();
+    isAdvertising = false;
+    Serial.println("Advertising burst ended.");
   }
 }
+
+
+void Fall_Frame_Send(uint8_t *fallFrame, uint8_t FallStatus){
+    uint8_t checksum = 0x00;
+    uint16_t payloadLength = 4;
+
+    fallFrame[0] = 0x055; // Start Byte
+    fallFrame[1] = (payloadLength >> 8) & 0xFF; // Length MSB
+    fallFrame[2] = payloadLength & 0xFF; // Length LSB
+    fallFrame[3] = 0x01; // End Device ID
+    fallFrame[4] = 0x99; // Command
+
+    /*Data Processing*/
+    if (FallStatus == 0){
+        fallFrame[5] = 0x00; // Data No Fall Detected!!!
+        Serial.println("No Fall Detected");
+    }else if (FallStatus == 1)  {
+        fallFrame[5] = 0xFF; // Data Fall Detected!!!
+        Serial.println("Fall Detected");
+    }
+
+    /*Checksum Calculation*/
+    for (int i = 3; i < 6; i++) {
+        checksum ^= fallFrame[i]; // Checksum
+    }
+    fallFrame[6] = checksum; // Checksum
+    fallFrame[7] = 0xCC; // End Byte
+
+    Serial.print("Actual Fall Frame: ");
+    for (int i = 0; i < 8; i++) {
+        Serial.print(fallFrame[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
+}
+
+
