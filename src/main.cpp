@@ -32,8 +32,11 @@ uint8_t FallStatus = 0;
 BLEServer *pServer;
 BLECharacteristic *pCharacteristic;
 BLEAdvertising *pAdvertising;
+BLEScan* pBLEScan;
 bool deviceConnected = false;
 uint8_t value = 0;
+int scanTime = 5;
+
 
 // Variables for non-blocking timing
 unsigned long previousMillis = 0;
@@ -75,6 +78,13 @@ class MyCallbacks : public BLECharacteristicCallbacks {
       Serial.println("*********");
     }
   }
+};
+
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) {
+      Serial.print("BLE Advertised Device found: ");
+      Serial.println(advertisedDevice.toString().c_str());
+    }
 };
 
 void init_service() {
@@ -135,6 +145,12 @@ void setup() {
 
   pAdvertising = pServer->getAdvertising();
 
+  pBLEScan = BLEDevice::getScan(); //create new scan
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true); //active scan uses more power, but get results faster
+  pBLEScan->setInterval(16000);
+  pBLEScan->setWindow(99);
+
   init_service();
   init_beacon(fallFrame);
 
@@ -142,6 +158,19 @@ void setup() {
 }
 
 void loop() {
+  BLEScanResults *foundDevices = pBLEScan->start(scanTime, false);
+  if (foundDevices->getCount() > 0) {
+    for (int i = 0; i < foundDevices->getCount(); i++) {
+      BLEAdvertisedDevice advertisedDevice = foundDevices->getDevice(i);
+      if (advertisedDevice.getName() == "Fall Frame Scan Test") {
+        Serial.println("Found target device!");
+        advertisedDevice.getScan();
+      }
+    }
+  }
+  
+
+
   if (deviceConnected) {
     Serial.printf("*** NOTIFY: %d ***\n", value);
     pCharacteristic->setValue(&value, 1);
