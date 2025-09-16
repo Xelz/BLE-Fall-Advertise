@@ -20,11 +20,21 @@
 #include <BLEBeacon.h>
 #include <string>
 #include <Arduino.h>
+#include "Seeed_Arduino_mmWave.h"
+
+#ifdef ESP32
+#  include <HardwareSerial.h>
+HardwareSerial mmwaveSerial(0);
+#else
+#  define mmwaveSerial Serial1
+#endif
 
 #define DEVICE_NAME         "ESP32-FTFD"
 #define SERVICE_UUID        "7A0247E7-8E88-409B-A959-AB5092DDB03E"
 #define BEACON_UUID         "2D7A9F0C-E0E8-4CC9-A71B-A21DB2D034A1"
 #define CHARACTERISTIC_UUID "82258BAA-DF72-47E8-99BC-B73D7ECD08A5"
+
+SEEED_MR60FDA2 mmWave;
 
 static uint8_t fallFrame[8];
 uint8_t FallStatus = 0;
@@ -43,10 +53,26 @@ unsigned long previousMillis = 0;
 unsigned long burstStartMillis = 0;
 const long interval = 10000; // 10 seconds
 const long burstDuration = 100; // 100 milliseconds
+unsigned long lastPrintMillis = 0;
+const unsigned long printInterval = 10000; // print once per 1s
+
+
+uint32_t sensitivity = 15;
+float height = 2.8, threshold = 1.0;
+float rect_XL, rect_XR, rect_ZF, rect_ZB;
+
+typedef enum {
+  EXIST_PEOPLE,
+  NO_PEOPLE,
+  PEOPLE_FALL,
+} MMWAVE_STATUS;
+
+MMWAVE_STATUS status = NO_PEOPLE, last_status = NO_PEOPLE;
+
 
 bool isAdvertising = false;
 
-void Fall_Frame_Send(uint8_t *fallFrame, uint8_t FallStatus);
+void Fall_Frame_Send(uint8_t *fallFrame, MMWAVE_STATUS status);
 void updateScanResponse(uint8_t *fallFrame);
 
 class MyServerCallbacks : public BLEServerCallbacks {
@@ -125,16 +151,17 @@ void init_beacon(uint8_t *fallFrame) {
   adv.setManufacturerData(String((char*)buf, 10));  // correct iBeacon payload
   pAdvertising->setAdvertisementData(adv);
 
-  pAdvertising->setMinInterval(0x10000); // Set min interval to 10 seconds
-  pAdvertising->setMaxInterval(0x10000); // Set max interval to
+  pAdvertising->setMinInterval(0x1000); // Set min interval to 10 seconds
+  pAdvertising->setMaxInterval(0x1000); // Set max interval to
   pAdvertising->start();
 
-  Serial.println("iBeacon advertising started (Apple 0x004C).");
+  // Serial.println("iBeacon advertising started (Apple 0x004C).");
 }
 
 
 void setup() {
   Serial.begin(115200);
+  mmWave.begin(&mmwaveSerial);
   Serial.println();
   Serial.println("Initializing...");
   Serial.flush();
@@ -155,17 +182,86 @@ void setup() {
   init_beacon(fallFrame);
 
   Serial.println("iBeacon + service defined and advertising!");
+
+  mmWave.setUserLog(0);
+
+  if (mmWave.setInstallationHeight(height)) {
+    Serial.printf("setInstallationHeight success: %.2f\n", height);
+  } else {
+    Serial.println("setInstallationHeight failed");
+  }
+
+  /** Set threshold **/
+  if (mmWave.setThreshold(threshold)) {
+    Serial.printf("setThreshold success: %.2f\n", threshold);
+  } else {
+    Serial.println("setThreshold failed");
+  }
+
+  /** Set sensitivity **/
+  if (mmWave.setSensitivity(sensitivity)) {
+    Serial.printf("setSensitivity success %d\n", sensitivity);
+  } else {
+    Serial.println("setSensitivity failed");
+  }
+
+  /** get new parameters of mmwave **/
+  if (mmWave.getRadarParameters(height, threshold, sensitivity, rect_XL,
+                                rect_XR, rect_ZF, rect_ZB)) {
+    Serial.printf("height: %.2f\tthreshold: %.2f\tsensitivity: %d\n", height,
+                  threshold, sensitivity);
+    Serial.printf(
+        "rect_XL: %.2f\trect_XR: %.2f\trect_ZF: %.2f\trect_ZB: %.2f\n", rect_XL,
+        rect_XR, rect_ZF, rect_ZB);
+  } else {
+    Serial.println("getRadarParameters failed");
+  }
+
 }
 
+
 void loop() {
-  BLEScanResults *foundDevices = pBLEScan->start(scanTime, false);
-  if (foundDevices->getCount() > 0) {
-    for (int i = 0; i < foundDevices->getCount(); i++) {
-      BLEAdvertisedDevice advertisedDevice = foundDevices->getDevice(i);
-      if (advertisedDevice.getName() == "Fall Frame Scan Test") {
-        Serial.println("Found target device!");
-        advertisedDevice.getScan();
+  if (mmWave.update(100)) {
+    bool is_human, is_fall;
+    // Get the human detection status
+    if (mmWave.getHuman(is_human)) {
+      // Get the fall detection status
+      if (mmWave.getFall(is_fall)) {
+        // Determine the status based on human and fall detection
+        if (!is_human && !is_fall) {
+          status = NO_PEOPLE;  // No human and no fall detected
+        } else if (is_fall) {
+          status = PEOPLE_FALL;  // Fall detected
+        } else {
+          status = EXIST_PEOPLE;  // Human detected without fall
+        }
       }
+    }
+    // Get the human detection status
+    if (!mmWave.getHuman(is_human) && !mmWave.getFall(is_fall)) {
+      status = NO_PEOPLE;  // No human and no fall detected
+    } else if (is_fall) {
+      status = PEOPLE_FALL;  // Fall detected
+    } else {
+      status = EXIST_PEOPLE;  // Human detected without fall
+    }
+  }
+
+ if (millis() - lastPrintMillis >= printInterval) {
+    lastPrintMillis = millis();
+
+    switch (status) {
+      case NO_PEOPLE:
+        Serial.println("Waiting for people");
+        break;
+      case EXIST_PEOPLE:
+        Serial.println("PEOPLE !!!");
+        break;
+      case PEOPLE_FALL:
+        Serial.println("FALL !!!");
+        break;
+      default:
+        break;
     }
   }
   
@@ -182,10 +278,7 @@ void loop() {
   if (!isAdvertising && millis() - previousMillis >= interval) {
     previousMillis = millis();
 
-    // The Fall_Frame_Send function now just updates the global fallFrame array.
-    // We'll alternate between 0 and 1 for demonstration.
-    FallStatus = (FallStatus == 0) ? 1 : 0;
-    Fall_Frame_Send(fallFrame, FallStatus);
+    Fall_Frame_Send(fallFrame, status);
 
     init_beacon(fallFrame);
 
@@ -206,7 +299,7 @@ void loop() {
 }
 
 
-void Fall_Frame_Send(uint8_t *fallFrame, uint8_t FallStatus){
+void Fall_Frame_Send(uint8_t *fallFrame, MMWAVE_STATUS status){
     uint8_t checksum = 0x00;
     uint16_t payloadLength = 4;
 
@@ -217,12 +310,18 @@ void Fall_Frame_Send(uint8_t *fallFrame, uint8_t FallStatus){
     fallFrame[4] = 0x99; // Command
 
     /*Data Processing*/
-    if (FallStatus == 0){
-        fallFrame[5] = 0x00; // Data No Fall Detected!!!
-        Serial.println("No Fall Detected");
-    }else if (FallStatus == 1)  {
-        fallFrame[5] = 0xFF; // Data Fall Detected!!!
+    if (status == PEOPLE_FALL){
+        fallFrame[5] = 0x01;
         Serial.println("Fall Detected");
+    }else if (status == EXIST_PEOPLE)  {
+        fallFrame[5] = 0x69;
+        Serial.println("People Detected");
+    }else if (status == NO_PEOPLE)  {
+        fallFrame[5] = 0x00;
+        Serial.println("No Fall Detected");
+    }else{
+        fallFrame[5] = 0xFF;
+        Serial.println("Status Unknown");
     }
 
     /*Checksum Calculation*/
