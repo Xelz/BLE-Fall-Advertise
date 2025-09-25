@@ -1,5 +1,9 @@
 {
     "files.associations": {
         "cmath": "cpp"
+    },
+    "sonarlint.connectedMode.project": {
+        "connectionId": "MYVISUAL",
+        "projectKey": "Xelz_BLE-Fall-Advertise"
     }
 }
